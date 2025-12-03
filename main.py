@@ -1,14 +1,12 @@
 import streamlit as st
-import os
 import re
-import time
-import ollama
+import google.generativeai as genai
 from pptx import Presentation
 from io import BytesIO
 
-# --- CONFIGURATION ---
-# Ensure you use a model you have locally. 
-MODEL_NAME = "qwen3:30b" 
+# --- CONSTANTS ---
+# 'gemini-1.5-flash' is the stable tag for the latest Flash model in the Python SDK
+MODEL_NAME = "gemini-flash-latest" 
 SEPARATOR = "@@@_START_SLIDE_CONTENT_@@@"
 
 # --- CSS & AESTHETICS ---
@@ -96,9 +94,8 @@ def inject_derek_central_css():
         padding: 2px;
     }
     
-    /* === FIX 1: PUSH TEXT INSIDE INPUT TO THE RIGHT === */
     [data-testid="stChatInput"] textarea {
-        padding-left: 15px !important; /* This moves the typing cursor and placeholder */
+        padding-left: 15px !important;
     }
 
     /* 7. GLASS PANELS */
@@ -131,7 +128,6 @@ def inject_derek_central_css():
         margin-bottom: 12px;
     }
     
-    /* === FIX: Move Bubble Text Right === */
     [data-testid="stChatMessageContent"] {
         padding-left: 20px !important;
         padding-right: 10px !important;
@@ -164,7 +160,6 @@ def extract_content(pptx_file):
 def apply_changes(prs, modified_text):
     updates = {}
     for line in modified_text.split('\n'):
-        # Robust regex to catch the ID and the content
         match = re.search(r"(\{S\d+:Sh\d+:P\d+\})\s*\|\|\s*(.*)", line)
         if match:
             uid = match.group(1)
@@ -202,31 +197,39 @@ def render_status_spinner(text, color_hex):
         </div>
     """
 
-def stream_with_initial_loader(context_prompt, placeholder_obj):
-    """
-    Fixed Stream Handler: Does NOT block on next() manually.
-    """
+def get_gemini_model(api_key):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(MODEL_NAME)
+
+def stream_with_initial_loader(context_prompt, placeholder_obj, api_key):
     placeholder_obj.markdown(
-        render_status_spinner("Connecting to Model...", "#f1c40f"), 
+        render_status_spinner("Connecting to Gemini Flash Latest...", "#f1c40f"), 
         unsafe_allow_html=True
     )
     
     try:
-        stream = ollama.chat(
-            model=MODEL_NAME,
-            messages=[{'role': 'user', 'content': context_prompt}],
-            stream=True
+        model = get_gemini_model(api_key)
+        
+        sys_prompt2 = (
+            "You are a Professional Presentation Architect communicates clearly, gives examples and guides the user but ultimately listens to their directives. \n"
+            "NOTE: Please remain grounded, impartial, realistic and accurate and remember the user does not see the internal pptx positional information. Only you do. Keep track of any connstraitns, requirements, preferences, specifications, etc forever. \n"
+            "PLAN: First, think, reason and plan the changes. Consider what the user wants, the best way to achieve it along with the best way to get there. Also consider what is already in the slide. Think, reason, plan, draft and consider multiple possibilities given the prior then tackle the whole thing.\n"
+            "When discussing slides reccall the user does not directly see the {S1:Sh2:P0} those are position tags that were parsed for you. They only see the stuff after the ||. You can reference the position tags to figure out the slide and position but they are intetnional for this Vixip Studio slide architect operation to work.\n"
+            "Please attempt to stay on task and relate the conversation to the slides, their goal, target audience, cultural context and relevancy. Think, reason, plan."
         )
+        
+        full_input = f"{sys_prompt2}\n\nUSER QUERY & CONTEXT:\n{context_prompt}"
+        response = model.generate_content(full_input, stream=True)
         
         has_started = False
         
-        for chunk in stream:
-            content = chunk['message']['content']
+        for chunk in response:
             if not has_started:
-                placeholder_obj.empty() # Clear spinner on first byte
+                placeholder_obj.empty()
                 has_started = True
             
-            yield content
+            if chunk.text:
+                yield chunk.text
             
         if not has_started:
             placeholder_obj.error("Model returned no response.")
@@ -234,8 +237,8 @@ def stream_with_initial_loader(context_prompt, placeholder_obj):
     except Exception as e:
         placeholder_obj.error(f"Connection Error: {str(e)}")
 
-# --- MAIN APP ---
-st.set_page_config(page_title="Vixip Studio", layout="wide")
+# --- MAIN APP INIT ---
+st.set_page_config(page_title="Vixip Studio", layout="wide", initial_sidebar_state="collapsed")
 inject_derek_central_css()
 
 # --- HEADER ---
@@ -251,11 +254,11 @@ if "chat_history" not in st.session_state: st.session_state["chat_history"] = []
 if "raw_pptx_text" not in st.session_state: st.session_state["raw_pptx_text"] = ""
 if "generator_instruction" not in st.session_state: st.session_state["generator_instruction"] = ""
 if "file_uploaded" not in st.session_state: st.session_state["file_uploaded"] = False
+if "api_key" not in st.session_state: st.session_state["api_key"] = ""
 
-# --- UPLOAD SECTION ---
+# --- STEP 1: UPLOAD SECTION ---
 if not st.session_state["file_uploaded"]:
-    st.markdown("### Upload Slides (.pptx)")
-    # === FIX: Added non-empty label + label_visibility to fix Console Warning ===
+    st.markdown("### Step 1: Upload Slides")
     uploaded_file = st.file_uploader("Upload PPTX", type="pptx", label_visibility="collapsed")
     
     if uploaded_file:
@@ -267,17 +270,41 @@ if not st.session_state["file_uploaded"]:
             st.session_state["raw_pptx_text"] = text
             st.session_state["file_uploaded"] = True
             st.rerun()
+
+# --- STEP 2: API KEY SECTION ---
+elif st.session_state["file_uploaded"] and not st.session_state["api_key"]:
+    st.success("✅ Slides Loaded Successfully!")
+    
+    st.markdown("### Step 2: Authenticate")
+    st.markdown("Please enter your Google Gemini API Key below.")
+    
+    key_input = st.text_input("Google API Key", type="password", placeholder="Paste Key Here (starts with AIza...)")
+    
+    if key_input:
+        # Basic validation could go here
+        st.session_state["api_key"] = key_input
+        st.rerun()
+    
+    # Option to reset file
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    if st.button("⬅️ Upload Different File"):
+        st.session_state["file_uploaded"] = False
+        st.session_state["raw_pptx_text"] = ""
+        st.rerun()
+
+# --- STEP 3: MAIN INTERFACE (Unlocked) ---
 else:
+    # Optional: Sidebar controls when fully unlocked
     with st.sidebar:
-        st.success("Analysis Active")
+        st.success("System Ready")
+        if st.button("Change API Key"):
+            st.session_state["api_key"] = ""
+            st.rerun()
         if st.button("Upload New File"):
             st.session_state["file_uploaded"] = False
             st.session_state["raw_pptx_text"] = ""
             st.rerun()
 
-# --- MAIN INTERFACE ---
-if st.session_state["file_uploaded"]:
-    
     tab_chat, tab_gen = st.tabs(["Chat & Strategy", "Slide Generator"])
 
     # === TAB 1: STREAMING CHAT ===
@@ -286,7 +313,7 @@ if st.session_state["file_uploaded"]:
         
         with chat_container:
             if not st.session_state["chat_history"]:
-                st.info("👋 Hey! I've loaded your slideshow. Wanna discuss your slides?")
+                st.info("👋 Hey! I've loaded your slides and connected to Gemini Flash. What's the plan?")
             
             for msg in st.session_state["chat_history"]:
                 with st.chat_message(msg["role"]):
@@ -302,7 +329,7 @@ if st.session_state["file_uploaded"]:
                 with st.chat_message("assistant"):
                     stream_placeholder = st.empty()
                     context = f"PPTX Content:\n{st.session_state['raw_pptx_text']}\n\nUser Question: {prompt}"
-                    full_response = st.write_stream(stream_with_initial_loader(context, stream_placeholder))
+                    full_response = st.write_stream(stream_with_initial_loader(context, stream_placeholder, st.session_state["api_key"]))
                     st.session_state["chat_history"].append({"role": "assistant", "content": full_response})
 
         if st.session_state["chat_history"]:
@@ -315,7 +342,7 @@ if st.session_state["file_uploaded"]:
                 )
                 st.toast("Strategy copied!", icon="🚀")
 
-    # === TAB 2: GENERATOR (With Fail-Safe) ===
+    # === TAB 2: GENERATOR ===
     with tab_gen:
         instruction = st.text_area(
             "Instructions", 
@@ -343,45 +370,39 @@ if st.session_state["file_uploaded"]:
                     "3. OUTPUT: After that line, write the modified lines in format {S#:Sh#:P#} || Text\n"
                     "Do not change IDs and when discussing slides do not mention them since the user does not see the {S1:Sh2:P0} || they only see the stuff after the ||. Only change the text not anything before the ||."
                 )
-                full_prompt = f"INSTRUCTION: {instruction}\n\nDATA:\n{st.session_state['raw_pptx_text']}"
+                full_prompt = f"SYSTEM INSTRUCTIONS:\n{sys_prompt}\n\nUSER REQUEST: {instruction}\n\nSLIDE DATA:\n{st.session_state['raw_pptx_text']}"
                 
                 try:
-                    status_box.markdown(render_status_spinner("Initializing Agent...", "#f1c40f"), unsafe_allow_html=True)
+                    status_box.markdown(render_status_spinner("Initializing Gemini Agent...", "#f1c40f"), unsafe_allow_html=True)
                     
-                    stream = ollama.chat(
-                        model=MODEL_NAME,
-                        messages=[{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': full_prompt}],
-                        stream=True
-                    )
+                    model = get_gemini_model(st.session_state["api_key"])
+                    response = model.generate_content(full_prompt, stream=True)
                     
-                    status_box.markdown(render_status_spinner("Working... (this might take awhile...)", "#8e44ad"), unsafe_allow_html=True)
+                    status_box.markdown(render_status_spinner("Working... (Gemini is reasoning...)", "#8e44ad"), unsafe_allow_html=True)
                     
                     thinking_buffer = ""
                     slide_content = ""
                     mode = "THINKING"
                     
-                    for chunk in stream:
-                        content = chunk['message']['content']
+                    for chunk in response:
+                        if not chunk.text: continue
+                        content = chunk.text
                         
                         if mode == "THINKING":
                             thinking_buffer += content
-                            # Check buffer for separator
                             if SEPARATOR in thinking_buffer:
                                 mode = "WRITING"
                                 status_box.markdown(render_status_spinner("Generating Final Slides...", "#2ecc71"), unsafe_allow_html=True)
                                 
-                                # Process what came after separator in this specific chunk
                                 parts = thinking_buffer.split(SEPARATOR)
                                 if len(parts) > 1:
                                     slide_content += parts[1]
                         else:
                             slide_content += content
 
-                    # === FAIL-SAFE: If model finished but never output separator ===
+                    # === FAIL-SAFE ===
                     if mode == "THINKING":
-                        # Recover slide text if it exists in the thinking buffer
                         if "{S0" in thinking_buffer or "||" in thinking_buffer:
-                            # Try to strip out the conversational part roughly
                             lines = thinking_buffer.split('\n')
                             valid_lines = [l for l in lines if "||" in l and "{" in l]
                             if valid_lines:
